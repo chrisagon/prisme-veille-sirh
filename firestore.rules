@@ -61,8 +61,7 @@ service cloud.firestore {
     // Admin email gate — doit matcher EXACTEMENT src/App.tsx:619-621
     function isAdminEmail() {
       return isSignedIn()
-        && (request.auth.token.email == "christof.thomas@gmail.com"
-            || request.auth.token.email.matches(".*admin.*"));
+        && request.auth.token.email == "christof.thomas@gmail.com";
     }
 
     // Entity helper VeilleSource validation (cf. src/types/veille.ts)

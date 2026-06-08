@@ -4,13 +4,20 @@ import dotenv from "dotenv";
 import OpenAI from "openai";
 import { createServer as createViteServer } from "vite";
 import nodemailer from "nodemailer";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 
 dotenv.config();
 
 const app = express();
+app.use(helmet({ contentSecurityPolicy: false }));
 const PORT = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ limit: "1mb", extended: true }));
+
+const llmLimiter = rateLimit({ windowMs: 60_000, max: 5, message: { error: "rate_limited" } });
+const smtpLimiter = rateLimit({ windowMs: 60_000, max: 10, message: { error: "rate_limited" } });
 
 // Nodemailer SMTP Transporter setup (Lazy initialization)
 let transporter: nodemailer.Transporter | null = null;
@@ -29,7 +36,7 @@ function getTransporter() {
   return transporter;
 }
 
-app.post("/api/newsletter/send", async (req, res) => {
+app.post("/api/newsletter/send", smtpLimiter, async (req, res) => {
   try {
     const { to, subject, html, fromOverride } = req.body;
     
@@ -292,7 +299,7 @@ cron.schedule("0 3 * * *", () => {
 // AC #12 : appelle scanActiveSources() AVANT generateWeeklyAutoReport() pour
 // garantir que le rapport est généré avec les sources les plus fraîches.
 // AC #12 alignement : `report` est `null` si le scan n'a trouvé aucun article.
-app.get("/api/veille/auto-generate", async (req, res) => {
+app.get("/api/veille/auto-generate", llmLimiter, async (req, res) => {
   try {
     const scanResult = await scanActiveSources();
     if (scanResult.articlesFound === 0) {
@@ -512,8 +519,14 @@ app.get("/api/veille/latest", async (_req, res) => {
   }
 });
 
-app.post("/api/veille/generate", async (req, res) => {
+app.post("/api/veille/generate", llmLimiter, async (req, res) => {
   const { rawText, customInstructions } = req.body;
+
+  if (typeof rawText !== "string") return res.status(400).json({ error: "rawText_required" });
+  if (rawText.length > 65536) return res.status(413).json({ error: "rawText_too_large", max: 65536 });
+  if (typeof customInstructions === "string" && customInstructions.length > 8192) {
+    return res.status(413).json({ error: "customInstructions_too_large", max: 8192 });
+  }
 
   if (!rawText || rawText.trim() === "") {
     return res.status(400).json({ error: "Du texte source est requis pour générer la veille." });

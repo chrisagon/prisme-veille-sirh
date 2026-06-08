@@ -75,6 +75,17 @@ import {
   serverTimestamp
 } from "firebase/firestore";
 
+function safeHref(url: string | undefined | null, fallback = "https://www.actuel-rh.fr/"): string {
+  if (typeof url !== "string" || url.length === 0) return fallback;
+  try {
+    const parsed = new URL(url);
+    if (["http:", "https:", "mailto:"].includes(parsed.protocol)) return url;
+    return fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 const getSourceUrl = (source: string, url?: string): string => {
   if (url && url.trim().length > 0) return url;
   
@@ -2469,7 +2480,7 @@ Par ailleurs, un baromètre Gartner publié la semaine dernière révèle que 74
                                 {currentUser ? (
                                   item.url ? (
                                     <a
-                                      href={item.url}
+                                      href={safeHref(item.url)}
                                       target="_blank"
                                       rel="noopener noreferrer"
                                       className="inline-flex items-center gap-1 text-[11px] font-bold text-sky-400 hover:text-sky-300 hover:underline transition bg-sky-950/40 border border-sky-900/50 hover:border-sky-500/40 px-2.5 py-1 rounded"
@@ -2903,7 +2914,7 @@ Par ailleurs, un baromètre Gartner publié la semaine dernière révèle que 74
                               {currentUser ? (
                                 (res.url || "https://www.actuel-rh.fr/") ? (
                                   <a
-                                    href={res.url || "https://www.actuel-rh.fr/"}
+                                    href={safeHref(res.url, "https://www.actuel-rh.fr/")}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     className="inline-flex items-center gap-0.5 text-[9.5px] font-bold text-sky-400 hover:text-sky-300 hover:underline transition bg-sky-950/35 border border-sky-900/30 hover:border-sky-500/30 px-1.5 py-0.5 rounded"
