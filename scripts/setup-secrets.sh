@@ -77,12 +77,17 @@ else
   echo "  ⚠ SKIP firebase-service-account (ni FIREBASE_SERVICE_ACCOUNT_JSON ni FIREBASE_SERVICE_ACCOUNT_FILE défini)" >&2
 fi
 
+# 5. Token admin (story 3.2 — endpoints /api/veille/force-scan et /api/veille/scan-status/:id)
+# Le user doit définir un secret fort (≥ 32 chars random). On l'utilise tel quel,
+# sans validation de complexité, pour rester agnostique du générateur.
+create_or_update "veille-admin-token" "${VEILLE_ADMIN_TOKEN:-}"
+
 # Donne les droits de lecture au runtime service account de Cloud Run
 # (compute engine default SA — elle est créée automatiquement au premier deploy)
 echo "→ Attribution des rôles secretmanager.secretAccessor au compute SA"
 RUNTIME_SA="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')-compute@developer.gserviceaccount.com"
 
-for SECRET in openrouter-api-key smtp-user smtp-pass firebase-service-account; do
+for SECRET in openrouter-api-key smtp-user smtp-pass firebase-service-account veille-admin-token; do
   gcloud secrets add-iam-policy-binding "$SECRET" \
     --project="$PROJECT" \
     --member="serviceAccount:$RUNTIME_SA" \
@@ -95,4 +100,4 @@ echo "✓ Secrets provisionnés pour $PROJECT"
 echo ""
 echo "Prochaine étape : gcloud run deploy prisme \\"
 echo "  --source . --region europe-west1 --allow-unauthenticated \\"
-echo "  --set-secrets=OPENROUTER_API_KEY=openrouter-api-key:latest,SMTP_USER=smtp-user:latest,SMTP_PASS=smtp-pass:latest,FIREBASE_SERVICE_ACCOUNT_JSON=firebase-service-account:latest"
+echo "  --set-secrets=OPENROUTER_API_KEY=openrouter-api-key:latest,SMTP_USER=smtp-user:latest,SMTP_PASS=smtp-pass:latest,FIREBASE_SERVICE_ACCOUNT_JSON=firebase-service-account:latest,VEILLE_ADMIN_TOKEN=veille-admin-token:latest"
