@@ -1,0 +1,6 @@
+{
+  "name": "PRISME",
+  "description": "Plateforme de veille stratégique hebdomadaire sur l'IA et son application dans les SIRH (Ressources Humaines), dotée d'outils de génération intelligente, d'archivage et de listes d'actions recommandées.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

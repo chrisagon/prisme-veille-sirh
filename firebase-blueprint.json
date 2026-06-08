@@ -1,0 +1,112 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User gamification progress and status",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID"
+        },
+        "email": {
+          "type": "string",
+          "description": "User email address"
+        },
+        "streak": {
+          "type": "integer",
+          "description": "Current active streak of days"
+        },
+        "completedLessons": {
+          "type": "array",
+          "description": "List of finished micro-lessons"
+        },
+        "completedResources": {
+          "type": "array",
+          "description": "List of read resources"
+        },
+        "completedQuizzes": {
+          "type": "array",
+          "description": "List of quiz codes that are fulfilled"
+        },
+        "completedActions": {
+          "type": "object",
+          "description": "Map of action tasks checkmarks keys to boolean values"
+        },
+        "newsletterEnabled": {
+          "type": "boolean",
+          "description": "Whether the user opted in to get weekly/daily newsletter e-mails"
+        },
+        "newsletterFrequency": {
+          "type": "string",
+          "enum": ["daily", "weekly"],
+          "description": "Preferred newsletter email trigger frequency"
+        },
+        "newsletterAlias": {
+          "type": "string",
+          "description": "Optional alias to use in the From header when sending the newsletter."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when this profile was initialized"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when this profile was last modified"
+        }
+      },
+      "required": [
+        "uid",
+        "email",
+        "streak",
+        "completedLessons",
+        "completedResources",
+        "completedQuizzes",
+        "completedActions",
+        "newsletterEnabled",
+        "newsletterFrequency"
+      ]
+    },
+    "VeilleReport": {
+      "title": "Veille Report",
+      "description": "Weekly generated watch report with AI or curated default reports",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique report identification"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase UID of report creator or 'system'"
+        },
+        "week": {
+          "type": "string",
+          "description": "Label of the week covered by this report"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of creation"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "week"
+      ]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Access private user progress, streaks and action checklist states"
+    },
+    "reports/{reportId}": {
+      "schema": "VeilleReport",
+      "description": "Access user-created or default shared watch reports"
+    }
+  }
+}

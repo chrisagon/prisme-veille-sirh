@@ -1,0 +1,258 @@
+{
+  "review_target": "Story 2-2 — extraction de contenu article",
+  "reviewer": "edge-case-hunter",
+  "date": "2026-06-04",
+  "findings": [
+    {
+      "id": "ECH-001",
+      "file": "src/server/veille/extractor.ts",
+      "lines": "106-121",
+      "severity": "high",
+      "confidence": 0.92,
+      "title": "Signal d'annulation non propagé au fetch sous-jacent",
+      "description": "`fetchArticleHtml` vérifie `signal?.aborted` à l'entrée et à la sortie mais ne le propage JAMAIS à `fetchWithRateLimit`. L'appel `fetchWithRateLimit(url, { allowHtml: true })` (ligne 115) ne reçoit pas le signal. Conséquence : si l'orchestrateur (story 2-3+) appelle `controller.abort()` en plein milieu du fetch, le téléchargement continue jusqu'à `MAX_BODY_BYTES` (5 MB) ou `TIMEOUT_MS` (3500 ms), on lit le body entier via `readTextBounded`, puis on jette `Error('Annulation demandée pendant lecture…')`. La bande passante et le timeout sont gaspillés pour un résultat destiné à être jeté. Le commentaire ligne 110-111 dit 'concaténé via try/catch sur AbortError' — c'est faux, aucun mécanisme de chaînage n'est en place.",
+      "repro": "1. Lancer `extractArticleContent(url, sourceId, 'sitemap', { signal: ctrl.signal })` où `ctrl` est un AbortController.\n2. 100 ms après le début du fetch, appeler `ctrl.abort()`.\n3. Observer : le fetch continue pendant 3.4 s, lit jusqu'à 5 MB, puis throw 'Annulation demandée pendant lecture'.\n4. L'orchestrateur reçoit `null` au lieu d'une annulation rapide.",
+      "fix": "Étendre `fetchWithRateLimit` pour accepter un `signal?: AbortSignal` dans ses options. En interne, écouter les deux AbortController (interne timeout + externe) avec `AbortController.any()` ou chaînage manuel : `const internal = new AbortController(); const timeoutId = setTimeout(() => internal.abort(), TIMEOUT_MS); external?.addEventListener('abort', () => internal.abort()); await fetch(url, { signal: internal.signal });` Propager ce paramètre depuis `fetchArticleHtml(url, options.signal)`.",
+      "evidence": "extractor.ts:112-119 ; fetch.ts:112-150 (signature `options: { headers?, allowHtml? }` — pas de `signal`)."
+    },
+    {
+      "id": "ECH-002",
+      "file": "src/server/veille/fetch.ts",
+      "lines": "85-98",
+      "severity": "high",
+      "confidence": 0.88,
+      "title": "Cap 5 MB contournable via Transfer-Encoding: chunked sans Content-Length",
+      "description": "`readBoundedBody` (alias `readTextBounded`) vérifie `content-length` à la ligne 87-92 puis appelle `response.text()` ligne 93. Quand le serveur répond en chunked sans `Content-Length` (très courant pour les pages HTML générées dynamiquement par les CMS), la pré-vérification est sautée (header absent = falsy). `response.text()` charge alors TOUT le body en RAM avant que la vérification post-lecture ligne 94 ne puisse rejeter. Le but du cap était d'éviter l'OOM — il est inopérant pour les flux chunked de plusieurs centaines de MB. Un serveur compromis ou mal configuré (ou un proxy qui décompresse un gzip massif) peut faire crasher le worker Node.",
+      "repro": "Héberger un endpoint qui répond `Transfer-Encoding: chunked` (pas de `Content-Length`) avec un body de 500 MB de texte. Appeler `fetchArticleHtml(url)`. Observer : `await response.text()` alloue 500 MB en RAM avant throw, ou OOM-kill le process.",
+      "fix": "Implémenter une lecture streamée bornée : `const reader = response.body.getReader(); let received = 0; const chunks: Uint8Array[] = []; while (true) { const { done, value } = await reader.read(); if (done) break; received += value.length; if (received > MAX_BODY_BYTES) { await reader.cancel(); throw new Error('Body trop volumineux (streaming)'); } chunks.push(value); } const text = new TextDecoder().decode(Buffer.concat(chunks.map(c => Buffer.from(c))));` Abandonner dès dépassement, sans charger la suite."
+    },
+    {
+      "id": "ECH-003",
+      "file": "src/server/veille/fetch.ts",
+      "lines": "116-150",
+      "severity": "high",
+      "confidence": 0.85,
+      "title": "SSRF bypass via redirection 3xx vers hôte privé",
+      "description": "`fetchWithRateLimit` valide `parsed.hostname` ligne 116-122 et applique `isBlockedHost` AVANT d'appeler `fetch`. Mais `fetch()` Node 18+ suit les redirections 30x PAR DÉFAUT (`redirect: 'follow'` implicite). Le check SSRF ne s'applique qu'à l'URL initiale. Un attaquant qui contrôle un domaine public peut répondre `301 Location: http://169.254.169.254/latest/meta-data/` ou `http://127.0.0.1:8080/admin` et le worker fetchera l'URL interne. Exfiltration de metadata cloud (IAM credentials AWS/GCP) ou pivot vers services internes.",
+      "repro": "1. Domaine public `evil.com/redirect` répond `HTTP 301 Location: http://169.254.169.254/latest/meta-data/iam/security-credentials/`.\n2. L'admin configure `evil.com` comme source RSS.\n3. `fetchWithRateLimit('https://evil.com/redirect')` → SSRF check passe (evil.com est public) → `fetch` suit la redirection → body contient les credentials IAM AWS.",
+      "fix": "Passer `redirect: 'manual'` à `fetch()` et valider chaque URL de redirection en relisant `response.headers.get('location')` et en ré-appliquant `isBlockedHost`. Ou utiliser un module dédié (`ssrf-req-filter`). Au minimum, limiter `redirect: 'error'` (rejeter toute 3xx) pour les sources allowlistées manuellement par l'admin."
+    },
+    {
+      "id": "ECH-004",
+      "file": "src/server/veille/extractor.ts",
+      "lines": "142-146",
+      "severity": "high",
+      "confidence": 0.9,
+      "title": "Mode dégradé bloque TOUTE extraction (incohérent avec scanner.ts)",
+      "description": "`extractArticleContent` retourne `null` IMMÉDIATEMENT si `getAdminDb() === null`. Le commentaire ligne 110-111 dit 'cohérent avec le mode dégradé de scanner.ts (story 2-1)'. FAUX : `scanner.ts` lignes 616-618 continue à scanner en mémoire (juste sans persistance Firestore) et collecte des articles candidats. `extractor.ts` au contraire coupe court à toute tentative d'extraction. Conséquence : en environnement sans credentials Firebase (dev local, premier déploiement, migration), 100 % des articles sont perdus alors qu'on pourrait les extraire et les mettre en file d'attente. AC #8 dit 'retourne `null` (pas d'erreur)' mais ne dit pas 'retourne `null` immédiatement' — la spec sous-entend que le skip concerne UNIQUEMENT la persistance, pas l'extraction. C'est aussi une violation de C4 (offline-first).",
+      "repro": "Déployer sans `FIREBASE_SERVICE_ACCOUNT_JSON` ni `GOOGLE_APPLICATION_CREDENTIALS`. `getAdminDb()` retourne `null`. Appeler `extractArticleContent` sur 50 articles valides. Tous retournent `null` avec log 'mode dégradé'. Aucun article n'est produit en mémoire pour le pipeline downstream.",
+      "fix": "Supprimer le check `if (getAdminDb() === null) return null;` au début de `extractArticleContent`. Le mode dégradé doit concerner uniquement la PERSISTANCE (cf. scanner.ts), pas l'extraction. Ajouter un commentaire : 'getAdminDb() === null ne bloque PAS l'extraction (le mode dégradé concerne uniquement la persistance Firestore).' Vérifier que le reste du pipeline (story 2-4+) gère correctement le cas où l'extraction réussit mais la persistance échoue."
+    },
+    {
+      "id": "ECH-005",
+      "file": "src/server/veille/extractor.ts",
+      "lines": "84-99",
+      "severity": "med",
+      "confidence": 0.8,
+      "title": "extractFromRssCandidate avec description absente retourne un ExtractedArticle vide valide",
+      "description": "`extractFromRssCandidate` reçoit `description?: string` et fait `const text = candidate.description ?? "";`. Si la description est `undefined` (cas qui peut survenir si l'appelant ne respecte pas la condition `options.description && options.description.trim().length > 0` de la ligne 149), on retourne un `ExtractedArticle` avec `textContent: ''`, `excerpt: ''`, `length: 0`, `html: ''`. L'objet passe silencieusement comme 'article valide mais vide'. Le scoring (story 2-3) tentera d'évaluer un texte vide et classera probablement l'article en queue (densité de mots-clés 0), ou pire, l'inclura dans le top 5 par accident. De plus, l'appelant ligne 149 NE PEUT PAS garantir que `description` n'est pas `undefined` car la signature `extractFromRssCandidate` accepte `description?: string` optionnel — c'est défensif à l'envers.",
+      "repro": "Appeler directement `extractFromRssCandidate({ url: 'x', title: 't', sourceId: 's', sourceType: 'rss' })` (sans `description`). Retourne `{ url: 'x', title: 't', excerpt: '', textContent: '', html: '', length: 0, sourceId: 's', sourceType: 'rss', extractedAt: '...' }` — passe le type check `ExtractedArticle`.",
+      "fix": "Deux options : (a) Changer la signature pour `description: string` (requis) et throw `Error('description requise pour chemin RSS')` si absent — l'orchestrateur catch et log. (b) Retourner `null` quand `description` est absent ou vide après trim. Option (b) est cohérente avec le contrat 'jamais de throw' du module. Ajouter une validation dans `extractArticleContent` ligne 149 pour garantir que `description.trim().length > 0` (déjà le cas, mais le typage ne le reflète pas)."
+    },
+    {
+      "id": "ECH-006",
+      "file": "src/server/veille/extractor.ts",
+      "lines": "60-63",
+      "severity": "med",
+      "confidence": 0.78,
+      "title": "Double seuil incohérent : Readability charThreshold: 500 + post-check 500 sur textContent.trim()",
+      "description": "Ligne 53 passe `charThreshold: 500` à Readability (rejette les pages < 500 chars AVANT parsing). Ligne 60 re-vérifie `article.textContent.trim().length < READABILITY_CHAR_THRESHOLD` (500) APRÈS parsing. Or, le `textContent` retourné par Readability est le texte net, sans balises. Le `charThreshold: 500` de Readability s'applique au HTML brut ou au texte ? Documentation Mozilla : `charThreshold` = 'minimum de caractères de texte pour qu'un article soit considéré comme valide'. Donc Readability filtre DÉJÀ les pages < 500 chars. Le post-check est redondant et surtout incohérent : si un futur dev ajuste l'un des deux seuils sans toucher l'autre, le comportement devient imprévisible. Pire : si Readability change sa sémantique entre versions (0.5 → 0.6), le check post-parse sauve la mise — c'est un filet de sécurité non documenté.",
+      "repro": "Modifier la constante `READABILITY_CHAR_THRESHOLD = 500` à 200 sans toucher au `charThreshold` passé à Readability. Conséquence : Readability.parse() retourne des articles de 200-499 chars (filtre relâché), mais le post-check ligne 60 les rejette. Comportement effectif inchangé — le code ment sur son intention.",
+      "fix": "Documenter explicitement le double check : 'charThreshold: 500 sur Readability (rejet rapide pre-parse) + post-check sur textContent.trim() (filet de sécurité si Readability change de comportement entre versions)'. Ou retirer le paramètre `charThreshold` de Readability et ne garder que le post-check (plus simple, comportement identique). Préférer l'option 1 pour la défense en profondeur."
+    },
+    {
+      "id": "ECH-007",
+      "file": "src/server/veille/types.ts",
+      "lines": "35-58",
+      "severity": "med",
+      "confidence": 0.85,
+      "title": "html: \"\" ambigu : chemin RSS vs extraction HTML échouée",
+      "description": "Spec dit 'HTML sanitisé (Readability `content`) ou chaîne vide si chemin RSS'. Le code respecte la spec. MAIS pour le consommateur (story 2-3+), `html === \"\"` est ambigu : (a) RSS path (normal, attendu), (b) HTML path avec `article.content === undefined` (cas où Readability a parsé mais le champ HTML est vide — rare mais possible), (c) HTML path où l'article a été extrait mais sans balises dans `content` (très rare). Pour distinguer, le consommateur doit inspecter `sourceType === 'rss'` ET `html === ''`. Couplage fragile. Une évolution future où un nouveau type de source produit du HTML vide créera des bugs silencieux.",
+      "repro": "Consumer story 2-3 voit `{ html: '', sourceType: 'sitemap' }` — sait-il si c'est un bug ou un cas valide ? Doit-il re-fetch ? Impossible à dire depuis le contrat actuel.",
+      "fix": "Remplacer `html: string` par `html: string | null` où `null` = chemin RSS (sémantique explicite). Mise à jour de `extractFromRssCandidate` : `html: null`. Mise à jour de `extractFromHtml` : `html: article.content ?? null` (au lieu de `?? ''`). Le type `string | null` est plus expressif en TypeScript. Doc en JSDoc : '/** `null` = chemin RSS, `string` = HTML sanitisé Readability (peut être `''` si extraction a réussi mais contenu HTML vide). */'. Alternative : ajouter un discriminant `path: 'rss' | 'html'` au lieu de réutiliser `sourceType`."
+    },
+    {
+      "id": "ECH-008",
+      "file": "src/server/veille/scanner.ts",
+      "lines": "211-240",
+      "severity": "med",
+      "confidence": 0.82,
+      "title": "parseRssFeed perd le contenu des éléments Atom <content> structurés (pas de #text)",
+      "description": "`pickText` (ligne 178-187) gère `string`, `number`, et les objets avec clé `#text` (texte mixte XML). Mais les flux Atom utilisent fréquemment `<content type=\"html\"><p>Hello <em>world</em></p></content>` — l'élément contient des SOUS-ÉLÉMENTS, pas un nœud texte. `fast-xml-parser` retourne alors un objet imbriqué : `{ p: [{ '#text': 'Hello ' }, { em: 'world' }] }`. `pickText` ne descend pas dans cette structure et retourne `\"\"`. Conséquence : tous les flux Atom (alternative à RSS 2.0) où `<content>` contient du HTML structuré seront traités comme 'pas de description', forçant un re-fetch HTML pour chaque article. Gaspillage de bande passante + latence + risque de timeout 3500 ms sur des sites lents.",
+      "repro": "Flux Atom : `<entry><title>T</title><link href=\"...\"/><content type=\"html\"><p>Article body</p></content></entry>`. `parseRssFeed` → `pickText(item.content)` retourne `\"\"` car l'objet n'a pas de `#text`. Le champ `description` est absent du candidat. Story 2-2 doit alors fetcher chaque URL au lieu de réutiliser le contenu RSS.",
+      "fix": "Étendre `pickText` pour aplatir récursivement un objet XML en concaténant tous les `#text` trouvés en profondeur (parcours DFS). Ou utiliser l'option `textNodeName: 'text'` de fast-xml-parser et inspecter tous les types. Ou activer l'option `arrayMode: false` (déjà fait) et utiliser `<content>__HTML_RAW__<p>...</p>__HTML_RAW__</content>` — non standard. La solution pragmatique : `function flattenXmlText(node: unknown): string { if (typeof node === 'string') return node; if (Array.isArray(node)) return node.map(flattenXmlText).join(' '); if (node && typeof node === 'object') { return Object.entries(node).filter(([k]) => k !== '@_').map(([_, v]) => flattenXmlText(v)).join(' '); } return ''; }` Appeler `flattenXmlText(item.content)` au lieu de `pickText(item.content)`."
+    },
+    {
+      "id": "ECH-009",
+      "file": "src/server/veille/scanner.ts",
+      "lines": "225-229",
+      "severity": "low",
+      "confidence": 0.75,
+      "title": "Doublon mémoire : rawDescription + description retenus simultanément",
+      "description": "Ligne 225-228 : `rawDescription` peut faire plusieurs MB (certains flux RSS 2.0 syndicaux ont un `<content:encoded>` qui dépasse 1 MB par item, ex. flux Medium complets). Ligne 229 : `const description = rawDescription.trim()` crée une SECONDE copie en RAM. Ligne 236 : `description` est inclus dans l'objet final via le spread. Pour un flux de 50 items × 1 MB = 100 MB de double-allocation transitoire (rawDescription + description par item, garbage collecté après le `.map()` mais pression mémoire pendant le scan). Avec Node 18 et le GC par défaut, cela peut déclencher des GC pauses visibles.",
+      "repro": "Parser un flux RSS de 50 items où chaque `<content:encoded>` fait 1 MB. Observer la heap Node pendant `.map()` : pic à ~100 MB puis libération. Sur les VPS peu memoryés (512 MB), risque de swap ou OOM.",
+      "fix": "Réutiliser la même variable : `const trimmed = rawDescription.trim(); ... description: trimmed`. Ou inliner : `description: (pickText(item['content:encoded']) || pickText(item.description) || pickText(item.content) || pickText(item.summary)).trim()`. Pas de variable intermédiaire."
+    },
+    {
+      "id": "ECH-010",
+      "file": "src/server/veille/scanner.ts",
+      "lines": "211-240",
+      "severity": "low",
+      "confidence": 0.7,
+      "title": "XML malformé : xmlParser.parse jette sans try/catch local",
+      "description": "`xmlParser.parse(xmlText)` ligne 212 n'est pas protégé par try/catch. Si un flux RSS est mal formé (CDATA non fermé, entité XML invalide, encodage cassé), `parse()` peut throw ou retourner un objet partiel. Le caller `scanSource` ligne 488-490 a un try/catch englobant (ligne 528-543) qui log '⚠️ [scanner] source X (URL) : message'. Mais le message d'erreur XML est peu explicite ('Invalid XML' / 'Unclosed root tag') et l'admin ne saura pas diagnostiquer. De plus, l'erreur est comptée comme 1 erreur de source et `lastScanAt` n'est PAS mis à jour (logique ligne 653) — la source sera retentée au prochain scan. Si le flux est chroniquement cassé, on gaspille des slots de scan.",
+      "repro": "Configurer une source avec un flux RSS où `<item><title>Test</title></item>` est mal fermé (manque `</item>` ou `</rss>`). Le scan échoue avec 'Unclosed root tag' et l'article est perdu.",
+      "fix": "Wrapper `xmlParser.parse(xmlText)` dans un try/catch local : `try { const parsed = xmlParser.parse(xmlText); ... } catch (err) { console.warn(`[scanner] XML malformé pour ${sourceId} : ${err.message}`); return []; }`. Documenter dans les logs que c'est un problème de source (pas de réseau)."
+    },
+    {
+      "id": "ECH-011",
+      "file": "src/server/veille/fetch.ts",
+      "lines": "26-27",
+      "severity": "low",
+      "confidence": 0.72,
+      "title": "HTML_ACCEPT_HEADER inclut application/xhtml+xml — JSDOM peut gérer mais Readability non testé",
+      "description": "`HTML_ACCEPT_HEADER = 'text/html, application/xhtml+xml'`. La négociation de contenu demande au serveur la version XHTML si possible. Certains sites (souvent mal configurés, ex. blogs WordPress avec plugin XHTML) répondent `application/xhtml+xml`. JSDOM parse le XHTML, Readability fait son travail. Mais : (a) le XHTML peut être en UTF-16 ou autre encodage que JSDOM ne décode pas correctement, (b) Readability a été conçu pour HTML 5, pas XHTML 1.1 strict, (c) le test manuel Story 2.2 task 5.1 utilise Wikipedia (qui retourne `text/html; charset=UTF-8`) — XHTML jamais testé en pratique. Si l'extraction XHTML produit des `textContent` vides ou cassés, l'article est silencieusement perdu.",
+      "repro": "Configurer une source dont l'URL retourne `Content-Type: application/xhtml+xml`. L'extracteur reçoit le XHTML. JSDOM parse. Readability produit un article. Selon la qualité du XHTML : succès ou échec silencieux.",
+      "fix": "Réduire `HTML_ACCEPT_HEADER` à `'text/html'` uniquement (accepter XHTML mais ne pas le demander activement). Les serveurs bien configurés répondent `text/html` par défaut. Ou ajouter un test manuel dans Task 5 : 'Test source XHTML (ex: blog avec plugin xhtml)' pour valider le chemin."
+    },
+    {
+      "id": "ECH-012",
+      "file": "src/server/veille/extractor.ts",
+      "lines": "38-44",
+      "severity": "low",
+      "confidence": 0.7,
+      "title": "JSDOM sans limite de ressources : HTML de 4.99 MB avec tags imbriqués bloque le worker",
+      "description": "`new JSDOM(html, { url })` ligne 38 n'a aucune option `{ runScripts: 'outside-only' }` ni limite de mémoire. Pour 5 MB de HTML avec 10 000 niveaux d'imbrication (DOM depth), JSDOM peut prendre 5-10 s et allouer 200+ MB. Avec 50 articles/scan en série (story 2-4), un seul article pathologique bloque tout le pipeline. Le cap 5 MB ne tient pas compte de la profondeur DOM ni du coût de parsing.",
+      "repro": "Héberger un article HTML de 4 MB avec `<div><div><div>...10000 levels...</div></div></div>`. Appeler `extractFromHtml(html, url, sourceId, 'sitemap')`. Observer : 5-15 s de parsing JSDOM, pic mémoire à 200+ MB.",
+      "fix": "Configurer JSDOM avec un wrapper : `const dom = new JSDOM(html, { url, runScripts: 'outside-only', resources: 'usable', pretendToBeVisual: false });` (les deux derniers réduisent la surface). Ou limiter la taille à 2 MB au lieu de 5 MB pour le chemin HTML (le RSS via content:encoded est en général < 500 KB). Alternative : pré-parser avec `htmlparser2` (synchrone, sans DOM) pour vérifier la profondeur avant de charger JSDOM."
+    },
+    {
+      "id": "ECH-013",
+      "file": "package.json",
+      "lines": "15, 24",
+      "severity": "low",
+      "confidence": 0.95,
+      "title": "Versions @mozilla/readability 0.5 et jsdom 25 outdated vs juin 2026 (0.6 et 29 disponibles)",
+      "description": "Story 2-2 spécifie `@mozilla/readability: ^0.5.0` (publié 2024) et `jsdom: ^25.0.0` (publié Q1 2025). En juin 2026 : `@mozilla/readability` est en **0.6.0** (mars 2025) avec corrections de bugs sur les pages structurées (ex. <article> imbriqués) et `jsdom` est en **29.x** avec optimisations mémoire + support Node 22+. Aucune raison documentée de pinner à 0.5 / 25 — la story dit 'compat versions' en Task 1.3 mais ne justifie pas le choix. Les patches de sécurité de 0.5.0 → 0.6.0 et 25.x → 29.x ne sont pas appliqués (readability n'a pas de CVE publique connue, mais jsdom 25 a des memory leaks documentés sur de gros documents).",
+      "repro": "Constat : `npm view @mozilla/readability version` retourne `0.6.0`. `npm view jsdom version` retourne `29.1.1`. Comparer les release notes 0.5 → 0.6 (bugfixes sur les pages AMP) et jsdom 25 → 29 (memory leaks, perf).",
+      "fix": "Mettre à jour : `\"@mozilla/readability\": \"^0.6.0\"` et `\"jsdom\": \"^26.0.0\"` (ou `^29.0.0` après test). Justifier dans un commentaire : 'Mis à jour 0.5 → 0.6 pour bugfixes pages structurées. jsdom 25 → 26 pour memory leak fix (CVE-2024-...).' Ajouter `\"engines\": { \"node\": \">=18\" }` au package.json (jsdom 25+ requiert Node 18, le projet utilise Node 18+ via fetch natif, mais ce n'est pas enforced)."
+    },
+    {
+      "id": "ECH-014",
+      "file": "src/server/veille/extractor.ts",
+      "lines": "162-166",
+      "severity": "low",
+      "confidence": 0.75,
+      "title": "Logs uniformes — pas de distinction abort/timeout/SSRF/parse error",
+      "description": "Le try/catch final ligne 162-166 catch TOUT (`err`) et log `[extractor] échec extraction URL (sourceId) : message` quel que soit le type d'échec. Pour un scan de 50 articles, on peut avoir : (a) 3 annulations orchestrateur (info, pas warning), (b) 2 timeouts réseau (transient, retry possible), (c) 1 hôte bloqué SSRF (permanent, à signaler à l'admin), (d) 5 pages trop courtes (qualité de source, à investiguer), (e) 1 OOM JSDOM (bug, à fixer). Tout logué au même niveau `console.warn` sans contexte actionnable.",
+      "repro": "Lancer un scan sur 50 articles mixtes. Compter les log lines : toutes au même niveau. Impossible de filtrer par type sans parser le message texte.",
+      "fix": "Différencier les types d'erreurs : `if (err.message.includes('Annulation')) console.info(...)` ; `if (err.message.includes('HTTP 5')) console.warn('[extractor] 5xx transient', ...)` ; `if (err.message.includes('SSRF')) console.error('[extractor] sécurité', ...)`. Ou structurer en JSON log : `{ level: 'warn', type: 'timeout', url, sourceId, retryable: true }`. Permet le monitoring production (Datadog, GCP Logging)."
+    },
+    {
+      "id": "ECH-015",
+      "file": "src/server/veille/extractor.ts",
+      "lines": "149",
+      "severity": "low",
+      "confidence": 0.8,
+      "title": "Chemin RSS : description whitespace-only redirige vers fetch même si non-vide",
+      "description": "Ligne 149 : `sourceType === 'rss' && options.description && options.description.trim().length > 0`. Le check trim() est correct. MAIS `extractFromRssCandidate` ligne 88 utilise `text.slice(0, 280)` sur le `description` NON trimmé. Si le RSS source a `<description>   Bonjour   </description>`, l'excerpt commence par 3 espaces. Affichage moche dans l'UI. Pareil pour `textContent` ligne 89 : les espaces de tête sont préservés dans le texte intégral envoyé à Gemini (story 2-5 pour résumé). Gemini reçoit '   Bonjour...' et peut normaliser mais consomme des tokens inutiles.",
+      "repro": "RSS item : `<description>   Bonjour le monde   </description>`. `extractFromRssCandidate` → `excerpt: '   Bonjour le monde   '.slice(0, 280) === '   Bonjour le monde   '` (3 espaces en tête). Affichage : '   Bonjour le monde'.",
+      "fix": "Dans `extractFromRssCandidate` ligne 88-89 : `const text = (candidate.description ?? '').trim();` puis utiliser `text` partout. Cohérent avec le check ligne 149 qui trime déjà."
+    },
+    {
+      "id": "ECH-016",
+      "file": "src/server/veille/extractor.ts",
+      "lines": "30-44",
+      "severity": "low",
+      "confidence": 0.7,
+      "title": "Encoding cassé : HTML ISO-8859-1 sans <meta charset> = JSDOM mal décode",
+      "description": "Node 18+ `response.text()` décode le body en se basant sur le header `Content-Type` charset. Si le serveur ne déclare pas charset et que le HTML n'a pas `<meta charset>`, Node décode en UTF-8 par défaut. Les pages ISO-8859-1 (latin1) avec accents FR (é, à, ç) deviennent des caractères cassés (Ã©, Ã , Ã§). JSDOM parse le HTML avec ces caractères erronés. Readability extrait un texte corrompu. Pour les sites FR anciens (ex. blogs de cabinets RH non migrés), 100 % des articles ont des accents cassés.",
+      "repro": "Héberger une page HTML en ISO-8859-1 sans déclarer charset (ni header ni meta). Récupérer via `fetchArticleHtml`. Observer : les accents français sont mal décodés (é → Ã©).",
+      "fix": "Avant `response.text()` dans `fetchArticleHtml`, vérifier le Content-Type : si charset manquant ET HTML commence par `<!DOCTYPE` ou `<html` sans `<meta charset>`, passer le body brut (ArrayBuffer) à JSDOM qui peut deviner l'encodage via la `<meta>` tag HTML. Ou utiliser `response.text()` mais en passant le charset détecté via une lib comme `jschardet`. Solution pragmatique : laisser JSDOM gérer (l'option `url` est déjà passée), tester avec une page FR connue (ex. legacy.lemonde.fr)."
+    },
+    {
+      "id": "ECH-017",
+      "file": "src/server/veille/fetch.ts",
+      "lines": "60",
+      "severity": "low",
+      "confidence": 0.9,
+      "title": "lastRequestPerHost non nettoyé : fuite mémoire long-running",
+      "description": "La Map `lastRequestPerHost` (ligne 60) accumule une entrée par host unique contacté, sans expiration. Pour un worker de scan qui tourne en cron hebdomadaire ET via admin manuel pendant des mois, et qui contacte des dizaines de sources hétérogènes, la Map grossit indéfiniment. Sur un an : 50 sources × 365 jours = 18 250 entrées potentielles (si les URLs varient). En pratique < 100, mais aucune hygiène. Pour les tests, `__resetRateLimitForTests` existe mais n'est pas appelé en production.",
+      "repro": "Worker up pendant 1 an avec 100 sources uniques configurées. `Map.size` après 1 an : 100. Mémoire négligeable (key string × 100 = ~5 KB). MAIS : si les sources changent d'URL (rotation), accumulation lente. Pas bloquant, mais sale.",
+      "fix": "Ajouter un TTL sur les entrées : `if (Date.now() - last > 60 * 60 * 1000) lastRequestPerHost.delete(hostname);` ou utiliser un LRU cache (`lru-cache` package déjà présent ? vérifier). Faible priorité car la Map est naturellement bornée par le nombre de sources."
+    },
+    {
+      "id": "ECH-018",
+      "file": "src/server/veille/scanner.ts",
+      "lines": "211-217",
+      "severity": "low",
+      "confidence": 0.75,
+      "title": "Flux RSS 0.9x / 0.91 sans <channel> parse incorrect",
+      "description": "Ligne 215 : `const channel = rss.channel ?? rss` suppose que RSS 2.0 et Atom ont une structure `rss.channel.item` ou `rss.feed.entry`. Pour les très vieux flux RSS 0.9 / 0.91 (rdf:RDF), la structure est `<rdf:RDF><item>...</item></rdf:RDF>` SANS `<channel>` parent. `xmlParser.parse` retournera `{ 'rdf:RDF': { item: [...] } }` qui ne matche ni `rss` ni `feed` → ligne 213 `parsed.rss ?? parsed.feed` est `undefined` → return `[]`. Articles perdus silencieusement. RSS 0.9 est rare en 2026 mais existe (archives INSEE, archives HAL).",
+      "repro": "Parser `<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><item><title>Ancien article</title><link>http://...</link></item></rdf:RDF>`. Retourne `[]` silencieusement.",
+      "fix": "Ajouter un fallback : `const rss = parsed.rss ?? parsed.feed ?? parsed['rdf:RDF'];`. Et pour RSS 0.9, le `channel` n'existe pas, `item` est directement sous `rdf:RDF` : `const itemsRaw = rss?.item ?? rss?.channel?.item ?? rss?.entry;`."
+    },
+    {
+      "id": "ECH-019",
+      "file": "src/server/veille/extractor.ts",
+      "lines": "51-58",
+      "severity": "low",
+      "confidence": 0.7,
+      "title": "Type manuel de l'article duplique la signature de Readability — désynchronisation possible",
+      "description": "Ligne 51 : `let article: { title: string; content: string; textContent: string; length: number; excerpt: string; byline?: string; siteName?: string } | null = null;` — type local qui DUPLIQUE celui de `@mozilla/readability`. Si Readability 0.5 → 0.6 change un champ (ex. `content` → `sanitizedContent` ou ajoute `dir`), le code ne le verra pas à la compilation et plantera à l'exécution. La spec dit 'Pas de LLM' mais ne dit pas 'utiliser les types officiels'. Aucun import du type officiel.",
+      "repro": "Upgrader `@mozilla/readability` à 0.6 sans toucher `extractor.ts`. Si le type change, `article.content` peut être `undefined` à l'exécution (passe le cast TypeScript car `??` est utilisé partout), mais `article.textContent` peut être un type différent (Array au lieu de string) → `.trim()` plante.",
+      "fix": "Importer le type officiel : `import { Readability, isProbablyReaderable, type ReadabilityArticle } from '@mozilla/readability';` puis `let article: ReadabilityArticle | null = null;`. Vérifier que le package exporte bien le type. Si non, créer un type local mais le marquer '// @deprecated: use ReadabilityArticle'."
+    },
+    {
+      "id": "ECH-020",
+      "file": "src/server/veille/fetch.ts",
+      "lines": "51-58",
+      "severity": "low",
+      "confidence": 0.8,
+      "title": "Variables d'env non validées au démarrage — TIMEOUT_MS et RATE_LIMIT_MS silencieusement NaN",
+      "description": "Lignes 51-58 : `Number.parseInt(process.env.SCAN_TIMEOUT_MS ?? String(DEFAULT_TIMEOUT_MS), 10) || DEFAULT_TIMEOUT_MS`. Si `SCAN_TIMEOUT_MS` est défini à `'abc'`, `parseInt` retourne `NaN`, le `|| DEFAULT_TIMEOUT_MS` (3500) prend le relais. Idem pour `SCAN_RATE_LIMIT_MS` → fallback à 1000. Comportement acceptable MAIS silencieux : l'admin qui tape une faute de frappe (`SCAN_TIME0UT_MS`) ne reçoit aucun warning, le worker tourne avec les valeurs par défaut. En prod, le timeout 3.5 s peut être trop court pour un site lent et le rate limit 1 s peut être trop agressif pour 100 sources.",
+      "repro": "Lancer le worker avec `SCAN_TIMEOUT_MS=not-a-number npm run dev`. Observer : aucun warning, timeout effectif 3500 ms, rate limit 1000 ms. L'admin pense avoir configuré autre chose.",
+      "fix": "Ajouter un warning explicite : `if (process.env.SCAN_TIMEOUT_MS && Number.isNaN(parsed)) console.warn(`[fetch] SCAN_TIMEOUT_MS invalide: ${process.env.SCAN_TIMEOUT_MS}, fallback ${DEFAULT_TIMEOUT_MS}ms`);` Pareil pour `SCAN_RATE_LIMIT_MS` et `SCAN_USER_AGENT`. Les logs aident au debug post-mortem."
+    }
+  ],
+  "summary": {
+    "total_findings": 20,
+    "by_severity": { "high": 4, "med": 4, "low": 12 },
+    "blocking": [
+      "ECH-001 (signal non propagé)",
+      "ECH-002 (cap 5 MB contournable en chunked)",
+      "ECH-003 (SSRF bypass via 3xx redirect)",
+      "ECH-004 (mode dégradé bloque l'extraction)"
+    ],
+    "should_fix_before_merge": [
+      "ECH-005 (extractFromRssCandidate description vide)",
+      "ECH-006 (double seuil 500)",
+      "ECH-007 (html: '' ambigu)"
+    ],
+    "nice_to_have": [
+      "ECH-008 (parseRssFeed Atom <content> structuré)",
+      "ECH-009 (doublon mémoire rawDescription)",
+      "ECH-010 (XML malformé pas de try/catch local)",
+      "ECH-011 (XHTML jamais testé)",
+      "ECH-012 (JSDOM sans limite ressources)",
+      "ECH-013 (versions outdated)",
+      "ECH-014 (logs uniformes)",
+      "ECH-015 (whitespace pas trimmé dans RSS path)",
+      "ECH-016 (encoding cassé ISO-8859-1)",
+      "ECH-017 (Map lastRequestPerHost pas nettoyée)",
+      "ECH-018 (RSS 0.9 non supporté)",
+      "ECH-019 (type local duplique ReadabilityArticle)",
+      "ECH-020 (env vars non validées au démarrage)"
+    ]
+  }
+}

@@ -1,0 +1,133 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Catch-all default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper: Valid IDs
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Entity helper profile validation
+    function isValidUserProfile(data) {
+      return data.uid is string 
+        && data.uid == request.auth.uid
+        && data.email is string
+        && data.email.size() <= 320
+        && data.streak is int
+        && data.streak >= 0
+        && data.completedLessons is list
+        && data.completedLessons.size() <= 200
+        && data.completedResources is list
+        && data.completedResources.size() <= 200
+        && data.completedQuizzes is list
+        && data.completedQuizzes.size() <= 200
+        && data.completedActions is map
+        && data.newsletterEnabled is bool
+        && data.newsletterFrequency is string
+        && (data.newsletterFrequency == "daily" || data.newsletterFrequency == "weekly")
+        && (!("newsletterAlias" in data) || data.newsletterAlias is string);
+    }
+
+    // Entity helper report validation
+    function isValidVeilleReport(data) {
+      return data.id is string
+        && data.id.size() <= 128
+        && data.ownerId is string
+        && data.ownerId == request.auth.uid
+        && data.week is string
+        && data.week.size() <= 200;
+    }
+
+    // Admin email gate — doit matcher EXACTEMENT src/App.tsx:619-621
+    function isAdminEmail() {
+      return isSignedIn()
+        && (request.auth.token.email == "christof.thomas@gmail.com"
+            || request.auth.token.email.matches(".*admin.*"));
+    }
+
+    // Entity helper VeilleSource validation (cf. src/types/veille.ts)
+    function isValidVeilleSource(data) {
+      return data.id is string
+        && data.id.size() <= 128
+        && data.id.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.name is string
+        && data.url is string
+        && data.type is string
+        && (data.type == "rss" || data.type == "sitemap" || data.type == "api")
+        && data.keywords is list
+        && data.categories is list
+        && data.active is bool
+        && data.scanFrequency is string
+        && (data.scanFrequency == "daily" || data.scanFrequency == "weekly" || data.scanFrequency == "custom")
+        && data.reliabilityScore is int
+        && data.reliabilityScore >= 0
+        && data.reliabilityScore <= 100
+        && (!("apiKeyEnvVar" in data) || data.apiKeyEnvVar is string)
+        && (!("cronExpression" in data) || data.cronExpression is string)
+        && (!("lastScanAt" in data) || data.lastScanAt == null || data.lastScanAt is timestamp);
+    }
+
+    // Match rules for users
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isOwner(userId) && isValidId(userId) && isValidUserProfile(incoming()) && incoming().createdAt == request.time;
+      allow update: if isOwner(userId) && isValidId(userId) && isValidUserProfile(incoming()) && incoming().updatedAt == request.time && incoming().createdAt == existing().createdAt;
+      allow delete: if false;
+    }
+
+    // Match rules for reports
+    match /reports/{reportId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Match rules for veille_sources — CAP-1 spec
+    // Index composite requis : (active ASC, scanFrequency ASC) — voir firestore.indexes.json
+    match /veille_sources/{sourceId} {
+      allow read: if isSignedIn();
+      allow create, update: if isAdminEmail() && isValidId(sourceId) && isValidVeilleSource(incoming());
+      allow delete: if isAdminEmail();
+    }
+
+    // Match rules for veille_raw_articles — CAP-2 spec (stockage tampon avec TTL 7j).
+    // Le backend (Admin SDK) bypasse les rules, donc toute l'écriture passe
+    // par le serveur. Côté client (App.tsx), aucune lecture directe : l'audit
+    // (story 2-6) lit aussi via Admin SDK, pas via client. Cohérent avec
+    // CAP-5 "C0 zéro hallucination" (pipeline server-side de bout en bout).
+    match /veille_raw_articles/{articleId} {
+      allow read: if isAdminEmail();
+      allow create, update, delete: if false;
+    }
+
+    // Match rules for veille_audit_log — CAP-5 spec (story 2-6).
+    // Collection racine peuplée exclusivement par le service `auditor.ts`
+    // côté Admin SDK (qui bypasse les rules). Côté client (App.tsx) aucune
+    // lecture directe : la consultation admin (AC #7) lit via Admin SDK
+    // depuis `server.ts`, gate Bearer `VEILLE_ADMIN_TOKEN`. La règle ci-
+    // dessous est un filet de sécurité supplémentaire (defense in depth)
+    // au cas où un client SDK authentifié tenterait un accès direct.
+    match /veille_audit_log/{entryId} {
+      allow read: if isAdminEmail();
+      allow create, update, delete: if false;
+    }
+  }
+}
