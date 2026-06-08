@@ -75,6 +75,17 @@ export function getDoc(ref: DocumentReference): Promise<DocumentSnapshot> {
   return ref.get();
 }
 
+/**
+ * Équivalent de `updateDoc(ref, data)` du SDK modulaire.
+ * `ref.update(data)` côté admin SDK.
+ */
+export function updateDoc(
+  ref: DocumentReference,
+  data: Record<string, unknown>,
+): Promise<void> {
+  return ref.update(data as { [key: string]: unknown });
+}
+
 // ============================================================================
 // FieldValue helpers
 // ============================================================================

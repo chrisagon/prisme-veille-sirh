@@ -67,7 +67,10 @@ development_status:
   # Smoke test local 3 cas (invalid → 400, valide indispo → 404, valide OK → 200).
   # Format weekId YYYY-wN (aligné sur structurer.ts).
   3-1-endpoint-api-de-recuperation-du-rapport-hebdomadaire: done
-  3-2-declenchement-manuel-admin-forcer-le-scan: ready-for-dev
+  # Story 3.2 (in-progress → done) : POST /api/veille/force-scan + GET /api/veille/scan-status/:scanId
+  # implémentés. scanLock.ts in-memory + scanRuns.ts (Firestore veille_scan_runs/{id}).
+  # 12/12 fixture helpers purs. Smoke test local : 401/400/503/429 tous OK.
+  3-2-declenchement-manuel-admin-forcer-le-scan: in-progress
   3-3-rendu-ui-des-rapports-reels-et-desactivation-simulation: backlog
   3-4-cron-hebdo-configurable-et-migration-des-rapports-existants: backlog
   epic-3-retrospective: optional

@@ -133,7 +133,9 @@ import { purgeExpiredArticles } from "./src/server/veille/persistence";
 import { structureWeeklyReport, computeWeekId } from "./src/server/veille/structurer";
 import { getPerplexityClient, isPerplexityConfigured, DEFAULT_MODEL } from "./src/server/veille/perplexityClient";
 import { loadReportFromFirestore } from "./src/server/veille/rapport";
-import { parseWeekId } from "./src/server/veille/weekId";
+import { parseWeekId, getCurrentWeekId } from "./src/server/veille/weekId";
+import { tryAcquireLock, releaseLock, heartbeatLock, _lockSize as _scanLockSize } from "./src/server/veille/scanLock";
+import { createScanRun, updateScanRun, getScanRun } from "./src/server/veille/scanRuns";
 import { getAdminDb } from "./src/server/firebaseAdmin";
 import { collection, getDocs, limit, orderBy, query } from "./src/server/lib/firestoreCompat";
 import { AUDIT_COLLECTION, filterByReason, isValidRejectionReason } from "./src/server/veille/auditor";
@@ -323,6 +325,176 @@ app.get("/api/veille/auto-generate", llmLimiter, async (req, res) => {
   } catch(err) {
     res.status(500).json({ error: "Generation failed" });
   }
+});
+
+// Story 3.2 : endpoint admin pour forcer manuellement un scan + structuration.
+// AC #1, #2, #3 : admin gate via `checkAdminAuth`, rate-limit `llmLimiter`.
+// AC #4 : fire-and-forget. Retourne 200 immédiat avec { status, weekId, scanId }.
+// AC #6 : double-trigger évité par `scanLock.ts` (in-memory Map) + lock Firestore
+//         du scanner worker (TTL 5 min).
+// AC #7 : mode dégradé Firestore → 503 firestore_unavailable.
+// Si dimanche 23h00-23h59 UTC → on sert quand même (force-scan explicite > cron).
+// Si weekId fourni dans query/body → on l'utilise, sinon currentWeekId.
+app.post("/api/veille/force-scan", llmLimiter, async (req, res) => {
+  const auth = checkAdminAuth(req);
+  if (!auth.ok) {
+    console.warn(`[force-scan] accès refusé : ${auth.reason}`);
+    return res.status(401).json({ error: "non autorisé", code: "ADMIN_GATE", reason: auth.reason });
+  }
+
+  // weekId optionnel (query > body > currentWeekId).
+  const rawWeek =
+    (typeof req.query.week === "string" && req.query.week) ||
+    (typeof req.body?.week === "string" && req.body.week) ||
+    null;
+  let weekId: string;
+  if (rawWeek) {
+    if (parseWeekId(rawWeek) === null) {
+      return res.status(400).json({ error: "weekId invalide", code: "BAD_WEEK_ID" });
+    }
+    weekId = rawWeek;
+  } else {
+    weekId = await getCurrentWeekId();
+  }
+
+  // Vérifier Firestore dispo (impossible de tracker un run sans Admin SDK).
+  const db = getAdminDb();
+  if (!db) {
+    console.warn(`[force-scan] Firestore indispo, refus weekId=${weekId}`);
+    return res.status(503).json({
+      error: "firestore_unavailable",
+      code: "FIRESTORE_UNAVAILABLE",
+      weekId,
+    });
+  }
+
+  // Anti-double-trigger : scanLock in-memory.
+  const lock = tryAcquireLock(weekId);
+  if (!lock.ok) {
+    console.log(`[force-scan] déjà en cours pour weekId=${weekId} (scanId=${lock.existingScanId})`);
+    return res.status(409).json({
+      error: "scan_already_running",
+      code: "SCAN_IN_PROGRESS",
+      weekId,
+      existingScanId: lock.existingScanId,
+    });
+  }
+
+  const scanId = lock.scanId;
+  const created = await createScanRun(scanId, weekId);
+  if (!created) {
+    // createScanRun retourne null si Firestore indispo (entre le check plus haut
+    // et maintenant, ou si le set a fail silencieusement). On libère le lock.
+    releaseLock(weekId);
+    return res.status(503).json({
+      error: "firestore_unavailable",
+      code: "FIRESTORE_UNAVAILABLE",
+      weekId,
+      scanId,
+    });
+  }
+
+  // Fire-and-forget : le scan est long (jusqu'à 5min pour Deep Research).
+  // On lance la chaîne en arrière-plan, le client poll ensuite
+  // `GET /api/veille/scan-status/:scanId`.
+  void (async () => {
+    const startedAtMs = Date.now();
+    let articlesScanned = 0;
+    let articlesKept = 0;
+    try {
+      console.log(`[force-scan] démarrage scanId=${scanId} weekId=${weekId}`);
+      const scanResult = await scanActiveSources();
+      articlesScanned = scanResult.articlesFound;
+      console.log(
+        `[force-scan] scanId=${scanId} terminé : ${scanResult.sourcesScanned} sources, ${scanResult.articlesFound} articles`,
+      );
+      // Heartbeat mid-run pour reset le stale lock.
+      heartbeatLock(weekId);
+      // Si aucun article → on ne génère pas de rapport, status=success mais
+      // articlesScanned=0. C'est un comportement attendu (semaine vide).
+      if (scanResult.articlesFound > 0) {
+        const report = await generateWeeklyAutoReport();
+        if (report) {
+          articlesKept = Array.isArray((report as { actualites?: unknown[] }).actualites)
+            ? (report as { actualites: unknown[] }).actualites.length
+            : 0;
+          await updateScanRun(scanId, {
+            status: "success",
+            articlesScanned,
+            articlesKept,
+          });
+          console.log(
+            `[force-scan] scanId=${scanId} status=success articlesKept=${articlesKept} durée=${Date.now() - startedAtMs}ms`,
+          );
+          return;
+        }
+      }
+      await updateScanRun(scanId, {
+        status: "success",
+        articlesScanned,
+        articlesKept: 0,
+      });
+      console.log(
+        `[force-scan] scanId=${scanId} status=success (rapport vide) durée=${Date.now() - startedAtMs}ms`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[force-scan] scanId=${scanId} crash : ${message}`);
+      await updateScanRun(scanId, {
+        status: "failed",
+        errorMessage: message.slice(0, 500),
+      });
+    } finally {
+      releaseLock(weekId);
+    }
+  })();
+
+  return res.status(200).json({
+    status: "started",
+    weekId,
+    scanId,
+    startedAt: new Date().toISOString(),
+    pollUrl: `/api/veille/scan-status/${scanId}`,
+  });
+});
+
+// Story 3.2 : endpoint de polling du statut d'un scan lancé via force-scan.
+// Admin gate (mêmes règles que force-scan) pour ne pas exposer l'état interne.
+// AC #8 : retourne status running/success/failed + counters si disponibles.
+// Mode dégradé Firestore → 503 (cohérent avec force-scan).
+app.get("/api/veille/scan-status/:scanId", async (req, res) => {
+  const auth = checkAdminAuth(req);
+  if (!auth.ok) {
+    console.warn(`[scan-status] accès refusé : ${auth.reason}`);
+    return res.status(401).json({ error: "non autorisé", code: "ADMIN_GATE", reason: auth.reason });
+  }
+
+  const scanId = req.params.scanId;
+  if (typeof scanId !== "string" || scanId.length === 0 || scanId.length > 200) {
+    return res.status(400).json({ error: "scanId invalide", code: "BAD_SCAN_ID" });
+  }
+
+  const db = getAdminDb();
+  if (!db) {
+    return res.status(503).json({ error: "firestore_unavailable", code: "FIRESTORE_UNAVAILABLE" });
+  }
+
+  const run = await getScanRun(scanId);
+  if (!run) {
+    return res.status(404).json({ error: "scan_not_found", code: "NOT_FOUND", scanId });
+  }
+
+  return res.status(200).json({
+    status: "ok",
+    scanId: run.scanId,
+    weekId: run.weekId,
+    runStatus: run.status,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt,
+    articlesScanned: run.articlesScanned ?? null,
+    articlesKept: run.articlesKept ?? null,
+    errorMessage: run.errorMessage ?? null,
+  });
 });
 
 // Story 2-4 : endpoint admin pour déclencher la purge des articles expirés

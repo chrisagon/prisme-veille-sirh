@@ -35,6 +35,7 @@ import {
   Database,
   ShieldCheck,
   RefreshCw,
+  Zap,
   Bell,
   Clock,
   Send
@@ -265,6 +266,16 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [isSimulated, setIsSimulated] = useState(false);
+
+  // Story 3.2 : force-scan admin. Token persistant en localStorage (saisie 1 fois
+  // par device), state de scan en cours pour polling auto toutes les 3s.
+  const [forceScanToken, setForceScanToken] = useState<string>(
+    () => localStorage.getItem("prisme_admin_token") || "",
+  );
+  const [forceScanInFlight, setForceScanInFlight] = useState(false);
+  const [forceScanStatus, setForceScanStatus] = useState<
+    null | { scanId: string; weekId: string; runStatus: string; articlesScanned: number | null; articlesKept: number | null; errorMessage: string | null; finishedAt: string | null }
+  >(null);
 
   // Copied status for visual feedback
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -1027,6 +1038,116 @@ export default function App() {
     }
   };
 
+  // Story 3.2 : handler "Forcer le scan" admin. Fire-and-forget : on lance
+  // le scan via POST /api/veille/force-scan (réponse 200 immédiat avec scanId),
+  // puis on poll GET /api/veille/scan-status/:scanId toutes les 3s jusqu'à
+  // status terminal (success | failed). Affiche un toast d'arrivée.
+  // AC : token requis (saisi dans la barre admin), pas d'auth via cookie/session.
+  const handleForceScan = async () => {
+    if (!forceScanToken) {
+      showToast("🔑 Token admin requis pour forcer un scan.");
+      return;
+    }
+    setForceScanInFlight(true);
+    setForceScanStatus(null);
+    try {
+      const res = await fetch("/api/veille/force-scan", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${forceScanToken}`,
+        },
+      });
+      if (res.status === 401) {
+        showToast("🚫 Token admin invalide.");
+        return;
+      }
+      if (res.status === 429) {
+        showToast("⏱️ Rate limit atteint, réessaie dans 1 min.");
+        return;
+      }
+      if (res.status === 409) {
+        const data = await res.json().catch(() => ({}));
+        showToast(`⚠️ Scan déjà en cours (${data.existingScanId ?? "?"}).`);
+        return;
+      }
+      if (res.status === 503) {
+        showToast("🛑 Firestore indispo côté serveur, réessaie plus tard.");
+        return;
+      }
+      if (!res.ok) {
+        showToast(`❌ Erreur HTTP ${res.status} au lancement du scan.`);
+        return;
+      }
+      const data = await res.json() as { scanId: string; weekId: string };
+      showToast(`🚀 Scan ${data.scanId.slice(0, 12)}… lancé pour ${data.weekId}.`);
+      // Polling toutes les 3s jusqu'à status terminal.
+      const poll = async (): Promise<void> => {
+        try {
+          const r = await fetch(`/api/veille/scan-status/${data.scanId}`, {
+            headers: { Authorization: `Bearer ${forceScanToken}` },
+          });
+          if (!r.ok) {
+            // 404 = doc pas encore créé par createScanRun (race), on continue.
+            // 503 = Firestore indispo transitoire, on continue.
+            if (r.status !== 404 && r.status !== 503) {
+              const txt = await r.text();
+              console.warn("[force-scan] poll error", r.status, txt);
+            }
+          } else {
+            const run = await r.json() as {
+              scanId: string;
+              weekId: string;
+              runStatus: string;
+              articlesScanned: number | null;
+              articlesKept: number | null;
+              errorMessage: string | null;
+              finishedAt: string | null;
+            };
+            setForceScanStatus(run);
+            if (run.runStatus === "running") {
+              setTimeout(poll, 3000);
+              return;
+            }
+            // Status terminal.
+            setForceScanInFlight(false);
+            if (run.runStatus === "success") {
+              const kept = run.articlesKept ?? 0;
+              const scanned = run.articlesScanned ?? 0;
+              showToast(
+                kept > 0
+                  ? `✅ Scan OK : ${scanned} articles scannés, ${kept} retenus dans le rapport.`
+                  : `✅ Scan OK : ${scanned} articles, mais aucun retenu (semaine vide).`,
+              );
+            } else if (run.runStatus === "failed") {
+              showToast(`❌ Scan échoué : ${run.errorMessage ?? "erreur inconnue"}.`);
+            }
+            return;
+          }
+        } catch (e) {
+          console.warn("[force-scan] poll crashed", e);
+        }
+        setTimeout(poll, 3000);
+      };
+      void poll();
+    } catch (err: any) {
+      console.error("[force-scan] launch crashed", err);
+      showToast(`❌ Erreur réseau : ${err?.message ?? "inconnue"}`);
+      setForceScanInFlight(false);
+    }
+  };
+
+  // Persistance du token admin (1 saisie par device, pas de re-prompt).
+  const updateForceScanToken = (value: string) => {
+    setForceScanToken(value);
+    try {
+      if (value) localStorage.setItem("prisme_admin_token", value);
+      else localStorage.removeItem("prisme_admin_token");
+    } catch {
+      // localStorage indispo (mode privé Safari) → on garde en mémoire, c'est tout.
+    }
+  };
+
   // Toggle checklist actions
   const toggleAction = (index: number) => {
     const key = `${activeReport.id}-${index}`;
@@ -1293,6 +1414,48 @@ Par ailleurs, un baromètre Gartner publié la semaine dernière révèle que 74
                 <RefreshCw className={`w-3.5 h-3.5 ${isGenerating ? "animate-spin" : ""}`} />
                 <span className="hidden sm:inline">Cron Auto (Hebdo)</span>
               </button>
+
+              {/* Story 3.2 : bouton "Forcer Scan" + input token admin. Token
+                  persisté en localStorage (clé `prisme_admin_token`) pour éviter
+                  de le redemander à chaque clic. Badge status live sous le bouton. */}
+              <input
+                type="password"
+                value={forceScanToken}
+                onChange={(e) => updateForceScanToken(e.target.value)}
+                placeholder="Token admin"
+                aria-label="Token admin (force-scan)"
+                className="bg-slate-900/80 border border-slate-700 hover:border-slate-600 focus:border-hr-green focus:outline-none text-slate-200 placeholder:text-slate-500 px-2 py-1.5 rounded-lg text-xs w-32 transition"
+                title="VEILLE_ADMIN_TOKEN — saisi 1 fois, persisté en localStorage"
+              />
+              <button
+                onClick={handleForceScan}
+                disabled={forceScanInFlight || !forceScanToken}
+                className="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 shadow-lg shadow-emerald-600/20 border border-emerald-500/25 transition cursor-pointer disabled:opacity-50"
+                title="Forcer un scan immédiat (toutes sources, ignore le cron hebdo)"
+              >
+                <Zap className={`w-3.5 h-3.5 ${forceScanInFlight ? "animate-pulse" : ""}`} />
+                <span className="hidden sm:inline">{forceScanInFlight ? "Scan…" : "Forcer Scan"}</span>
+              </button>
+              {forceScanStatus && (
+                <span
+                  className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                    forceScanStatus.runStatus === "success"
+                      ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
+                      : forceScanStatus.runStatus === "failed"
+                      ? "bg-rose-500/20 text-rose-300 border border-rose-500/40"
+                      : "bg-slate-700/60 text-slate-300 border border-slate-600"
+                  }`}
+                  title={`scanId=${forceScanStatus.scanId} weekId=${forceScanStatus.weekId}`}
+                >
+                  {forceScanStatus.runStatus}
+                  {forceScanStatus.runStatus === "success" && forceScanStatus.articlesScanned != null && (
+                    <> · {forceScanStatus.articlesScanned} sc.</>
+                  )}
+                  {forceScanStatus.runStatus === "success" && forceScanStatus.articlesKept != null && (
+                    <>, {forceScanStatus.articlesKept} gardés</>
+                  )}
+                </span>
+              )}
 
               <button
                 onClick={() => setShowGenerator(!showGenerator)}

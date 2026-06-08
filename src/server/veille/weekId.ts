@@ -54,3 +54,38 @@ export function computeWeekIdLocal(date: Date): string {
   const clamped = Math.max(1, Math.min(53, weekNum));
   return `${d.getUTCFullYear()}-w${clamped}`;
 }
+
+// ============================================================================
+// Story 3.2 helpers : scheduling per-source + lock staleness
+// ============================================================================
+
+/** Lock considéré stale si dernier heartbeat > 10 min. */
+export const STALE_LOCK_THRESHOLD_MS = 10 * 60 * 1000;
+
+/** Plage horaire "dimanche soir" où le cron va tourner (23h00-23h59). */
+export const SUNDAY_LATE_HOUR_START = 23;
+export const SUNDAY_LATE_HOUR_END = 23;
+export const SUNDAY_DAY = 0; // 0 = dimanche en getUTCDay()
+
+/**
+ * Helper : détecte si on est dimanche entre 23h00 et 23h59 UTC.
+ * Utilisé par le force-scan pour éviter de doubler avec le cron hebdo.
+ *
+ * @param date Date à tester (par défaut `new Date()`)
+ * @returns `true` si dimanche 23h00-23h59 UTC
+ */
+export function isSundayLateAfternoon(date: Date = new Date()): boolean {
+  return date.getUTCDay() === SUNDAY_DAY && date.getUTCHours() >= SUNDAY_LATE_HOUR_START;
+}
+
+/**
+ * Helper : détermine si un lock (basé sur son dernier heartbeat) est stale.
+ * Utilisé par le force-scan pour reprendre un lock abandonné par un crash.
+ *
+ * @param lastHeartbeatMs Timestamp Unix (ms) du dernier heartbeat
+ * @param nowTs Timestamp de référence (par défaut `Date.now()`)
+ * @returns `true` si le lock est stale (> STALE_LOCK_THRESHOLD_MS sans heartbeat)
+ */
+export function isStaleLock(lastHeartbeatMs: number, nowTs: number = Date.now()): boolean {
+  return nowTs - lastHeartbeatMs > STALE_LOCK_THRESHOLD_MS;
+}
