@@ -1,5 +1,5 @@
 # generated: 2026-06-03
-# last_updated: 2026-06-05T05:30:00.000Z
+# last_updated: 2026-06-08T20:00:00.000Z
 # project: prisme
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-06-03
-last_updated: 2026-06-05
+last_updated: 2026-06-08
 project: prisme
 project_key: NOKEY
 tracking_system: file-system
@@ -56,14 +56,13 @@ development_status:
   # en env var pour fonctionner (fail-closed sinon). Définir dans .env.local.
   2-4-stockage-temporaire-firestore-avec-ttl: done
   2-5-structuration-en-5-categories-metier-gemini: done
-  # Story 2-6 (in-progress → review) : log d'audit `veille_audit_log` opérationnel
-  # côté writer (auditor.ts) + wire persistence/structurer + endpoint admin
-  # GET /api/veille/admin/audit-log. 25/25 tests fixture OK. En attente code
-  # review (D-1 fire-and-forget, AC #3/#4 BREAKING signature, AC #5 wire unique).
-  2-6-citation-verifiable-et-log-d-audit: review
+  # Story 2-6 (done) : log d'audit `veille_audit_log` opérationnel côté writer
+  # (auditor.ts) + endpoint admin GET /api/veille/admin/audit-log. Code review
+  # 2026-06-08 : code déployé en prod, validant R1 (mark done car déjà en prod).
+  2-6-citation-verifiable-et-log-d-audit: done
   epic-2-retrospective: optional
-  epic-3: backlog
-  3-1-endpoint-api-de-recuperation-du-rapport-hebdomadaire: backlog
+  epic-3: in-progress
+  3-1-endpoint-api-de-recuperation-du-rapport-hebdomadaire: ready-for-dev
   3-2-declenchement-manuel-admin-forcer-le-scan: backlog
   3-3-rendu-ui-des-rapports-reels-et-desactivation-simulation: backlog
   3-4-cron-hebdo-configurable-et-migration-des-rapports-existants: backlog
