@@ -1,5 +1,5 @@
 # generated: 2026-06-03
-# last_updated: 2026-06-08T20:00:00.000Z
+# last_updated: 2026-06-08T22:00:00.000Z
 # project: prisme
 # project_key: NOKEY
 # tracking_system: file-system
@@ -62,8 +62,12 @@ development_status:
   2-6-citation-verifiable-et-log-d-audit: done
   epic-2-retrospective: optional
   epic-3: in-progress
-  3-1-endpoint-api-de-recuperation-du-rapport-hebdomadaire: ready-for-dev
-  3-2-declenchement-manuel-admin-forcer-le-scan: backlog
+  # Story 3.1 (done) : endpoint GET /api/rapport/[week] opérationnel.
+  # 24/24 tests fixture OK (parseWeekId, computeWeekIdLocal, isValidReportShape).
+  # Smoke test local 3 cas (invalid → 400, valide indispo → 404, valide OK → 200).
+  # Format weekId YYYY-wN (aligné sur structurer.ts).
+  3-1-endpoint-api-de-recuperation-du-rapport-hebdomadaire: done
+  3-2-declenchement-manuel-admin-forcer-le-scan: ready-for-dev
   3-3-rendu-ui-des-rapports-reels-et-desactivation-simulation: backlog
   3-4-cron-hebdo-configurable-et-migration-des-rapports-existants: backlog
   epic-3-retrospective: optional
