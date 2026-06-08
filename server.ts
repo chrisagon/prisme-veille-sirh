@@ -132,6 +132,8 @@ import { scanActiveSources } from "./src/server/veille/scanner";
 import { purgeExpiredArticles } from "./src/server/veille/persistence";
 import { structureWeeklyReport, computeWeekId } from "./src/server/veille/structurer";
 import { getPerplexityClient, isPerplexityConfigured, DEFAULT_MODEL } from "./src/server/veille/perplexityClient";
+import { loadReportFromFirestore } from "./src/server/veille/rapport";
+import { parseWeekId } from "./src/server/veille/weekId";
 import { getAdminDb } from "./src/server/firebaseAdmin";
 import { collection, getDocs, limit, orderBy, query } from "./src/server/lib/firestoreCompat";
 import { AUDIT_COLLECTION, filterByReason, isValidRejectionReason } from "./src/server/veille/auditor";
@@ -517,6 +519,43 @@ app.get("/api/veille/latest", async (_req, res) => {
     if (code === 9 /* FAILED_PRECONDITION */) reason = "missing_index";
     console.warn(`[veille/latest] lecture échouée (${reason}) : ${message}`);
     return res.status(200).json({ report: null, reason, error: message });
+  }
+});
+
+// Story 3.1 : endpoint de récupération d'un rapport par weekId.
+// Format : YYYY-wN (cf. `parseWeekId`). Pas d'admin gate (lecture publique).
+// Réponse 200 (ok/firestore_unavailable) / 400 (weekId invalide) / 404 (absent).
+app.get("/api/rapport/:week", async (req, res) => {
+  const weekId = req.params.week;
+  if (parseWeekId(weekId) === null) {
+    console.log(`[rapport] GET weekId=${weekId} status=bad_request`);
+    return res.status(400).json({ status: "bad_request" });
+  }
+  try {
+    const report = await loadReportFromFirestore(weekId);
+    if (report) {
+      console.log(`[rapport] GET weekId=${weekId} status=ok`);
+      return res.status(200).json({
+        status: "ok",
+        report,
+        fetchedAt: new Date().toISOString(),
+      });
+    }
+    console.log(`[rapport] GET weekId=${weekId} status=not_found`);
+    return res.status(404).json({ status: "not_found" });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const code = (err as { code?: number }).code;
+    // Modes dégradés Firestore : codes 5 (NOT_FOUND), 14 (unavailable),
+    // 4 (DEADLINE_EXCEEDED), 13 (INTERNAL) → 200 + firestore_unavailable.
+    if (code === 4 || code === 5 || code === 13 || code === 14) {
+      console.warn(
+        `[rapport] GET weekId=${weekId} status=firestore_unavailable : ${message}`,
+      );
+      return res.status(200).json({ status: "firestore_unavailable", report: null });
+    }
+    console.error(`[rapport] GET weekId=${weekId} status=internal_error : ${message}`);
+    return res.status(500).json({ status: "internal_error", error: message });
   }
 });
 
