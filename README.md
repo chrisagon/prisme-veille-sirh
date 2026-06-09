@@ -88,7 +88,6 @@ Dockerfile                         # multi-stage Cloud Run build
 - **Helmet** + **rate-limiting** (`express-rate-limit`) sur tous les endpoints sensibles
 - **Body cap** 1MB sur tous les endpoints
 - **URL scheme allowlist** (`safeHref()`) contre `javascript:` / `data:` XSS
-- **Admin gate** exact match sur `christof.thomas@gmail.com` (plus de regex `.*admin.*`)
 - **Validation** des inputs LLM (`rawText` 64KB cap, `customInstructions` 8KB cap)
 - **Firestore rules** : user profile validation, isOwner pour users/{uid}
 - **Admin SDK** côté serveur uniquement, bypass des rules pour le pipeline veille
